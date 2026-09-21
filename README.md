@@ -4,12 +4,6 @@ A standalone Discord bot that verifies **Roblox audio** assets, grants your game
 permission to use group-owned audio, and gives staff a set of audio-analysis /
 copyright-avoidance tools. Built for the workflow where you want to sanity-check
 an `rbxassetid://` audio id before wiring it into an in-game audio player.
-
-> **License:** GPL-3.0. This bot is a fork of
-> [typicaalusername/scope](https://github.com/typicaalusername/scope) — the
-> attribution is retained in the source. If you distribute changes, keep it
-> GPL-3.0 and credit the original author.
-
 ---
 
 ## Folder layout
