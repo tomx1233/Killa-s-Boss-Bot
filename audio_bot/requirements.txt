@@ -1,0 +1,19 @@
+# --- Core bot runtime ---
+discord.py>=2.7
+python-dotenv>=1.0
+numpy>=1.24
+pillow>=10.0
+
+# --- /shazam + /cr Auto-Fit engine (optional but recommended) ---
+# Needed only for those two commands. If you skip these, the rest still works;
+# /shazam and /cr Auto-Fit reply with a clear "missing dependency" message.
+librosa>=0.10
+soundfile>=0.12
+requests>=2.31
+pytz
+songrec
+
+# --- /download ---
+# Needs the standalone yt-dlp CLI on PATH (`winget install yt-dlp.yt-dlp`), not
+# a pip module. ffmpeg/ffprobe must also be on PATH for /analyze, /cr, /roblox,
+# /shazam (and the /cr spectrogram).
