@@ -8,11 +8,13 @@ through `asyncio.to_thread` so it never blocks the Discord event loop.
 
 Command surface this module backs (the slash wrappers live in audio_bot.py):
   /analyze      -> analyze_audio() + render_waveform()
-  /cr         -> cr_process()                        (preset key/speed shift)
   /roblox       -> roblox_simulate()                     (two-pass ogg compression)
   /monitor      -> get_asset_moderation()                (poll a Roblox asset's moderation)
   /download     -> download_media() (yt-dlp CLI: audio mp3 or <=720p video mp4)
   /ping         -> get_system_stats()
+
+/cr autofit and /shazam are placeholders in audio_bot.py. They do not call
+this module.
 
 Attribution: this bot is a fork of typicaalusername's Scope bot (GPL-3.0). The
 ffmpeg filter recipes (ebur128 loudness, showwavespic overlay, anequalizer notch,
@@ -28,19 +30,12 @@ import re
 import shutil
 import subprocess
 import urllib.error
-import urllib.parse
 import urllib.request
 
 # The grant account session used for user-auth / toolbox endpoints. Loaded from
 # .env the same way grant_audio does (audio_bot.py calls load_dotenv before
 # importing this module, so the var is already present).
 ROBLOX_COOKIE = os.getenv("ROBLOX_COOKIE", "")
-
-# The workspace root that holds the audio-modifier engine (shazam_proof.py +
-# songrec_tester.py + fingerprint_oracle.py, plus the SongRec package). In this
-# handoff copy those files sit in the folder one level up from audio_bot/ (the
-# bot folder's parent). If you move them, point this at that folder.
-WORKSPACE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/146.0 Safari/537.36 RobloxApp")
@@ -99,17 +94,6 @@ def _loudness(path):
             float(m_peak.group(1)) if m_peak else None)
 
 
-def _sample_rate(path):
-    """Pull the audio stream sample rate (ffprobe), defaulting sensibly."""
-    try:
-        data = ffprobe_json(path)
-        stream = next(s for s in data.get("streams", [])
-                      if s.get("codec_type") == "audio")
-        return int(stream.get("sample_rate") or 44100) or 44100
-    except Exception:
-        return 48000
-
-
 # --------------------------------------------------------------------------- #
 # /analyze
 # --------------------------------------------------------------------------- #
@@ -149,212 +133,6 @@ def render_waveform(path, out_path, size="1920x660"):
     if rc != 0:
         raise RuntimeError("waveform render failed." + (f" ({err.strip()})" if err.strip() else ""))
     return out_path
-
-
-# Brand tint for the spectrogram image: recolor the ffmpeg luminance ramp onto the
-# KILLA'S BOSS blue-purple palette so the graph matches the embeds + waveform
-# (dark violet -> brand purple -> peak blue) instead of the default plasma ramp.
-_BRAND_LOW = (58, 25, 76)     # deep violet  #3A194C
-_BRAND_MID = (92, 61, 140)    # rms purple   #5C3D8C
-_BRAND_HIGH = (41, 134, 204)  # peak blue    #2986CC
-
-
-def _brand_spectrogram(path):
-    """Recolor `path` (an ffmpeg spectrogram PNG) onto the brand blue/purple ramp.
-
-    ffmpeg's showspectrumpic `color` option only accepts named colormaps (plasma,
-    magma, ...) -- none is the KILLA'S BOSS palette. So we keep any valid colormap,
-    take its grayscale luminance as the energy ramp, and redraw it as a
-    dark-violet -> purple -> blue gradient that matches the waveform + embeds.
-    """
-    import numpy as np
-    from PIL import Image
-
-    lum = np.asarray(Image.open(path).convert("L"), dtype=np.float32) / 255.0
-    low, mid, high = (np.array(_BRAND_LOW, np.float32),
-                      np.array(_BRAND_MID, np.float32),
-                      np.array(_BRAND_HIGH, np.float32))
-    t = np.clip(lum, 0.0, 1.0)[..., None]            # (h, w, 1)
-    down = low + (mid - low) * np.clip(t * 2.0, 0.0, 1.0)
-    up = mid + (high - mid) * np.clip((t - 0.5) * 2.0, 0.0, 1.0)
-    rgb = np.where(t <= 0.5, down, up).astype("uint8")
-    Image.fromarray(rgb, "RGB").save(path)
-
-
-# /cr preset table: name -> (pitch_semitones, tempo_factor).
-# These just re-encode a file with a key/speed shift; the names stay neutral.
-CR_PRESETS = {
-    "subtle":     (1.5, 1.04),
-    "balanced":   (2.0, 1.07),
-    "stealth":    (2.5, 1.10),
-    "aggressive": (3.0, 1.12),
-}
-
-
-def cr_process(input_path, output_path, spectrogram_path, preset_name="balanced"):
-    """Re-encode a file with an independent pitch + tempo shift preset.
-
-    Uses `asetrate` to shift the pitch and `atempo` to restore or change the
-    tempo, so a file can be shifted in key and/or speed independently of its
-    duration. Returns the rebuilt info dict for the processed file.
-    """
-    if preset_name not in CR_PRESETS:
-        raise RuntimeError(f"unknown preset {preset_name!r}")
-    semi, tempo = CR_PRESETS[preset_name]
-    pitch_factor = 2.0 ** (semi / 12.0)
-    sr = _sample_rate(input_path)
-
-    # asetrate=sr*pitch_factor raises pitch (and speed) by pitch_factor;
-    # aresample returns to the source rate; atempo=1/pitch_factor restores the
-    # original tempo while keeping the shifted pitch; atempo=tempo applies the
-    # preset's tempo change. Each factor stays inside atempo's 0.5-2.0 range.
-    af = (
-        f"asetrate={sr * pitch_factor:.6f},"
-        f"aresample={sr},"
-        f"atempo={1.0 / pitch_factor:.6f},"
-        f"atempo={tempo:.6f}"
-    )
-
-    rc, _out, err = _run(_FFMPEG + ["-i", input_path, "-af", af,
-                                    "-c:a", "libmp3lame", "-b:a", "192k", output_path])
-    if rc != 0:
-        raise RuntimeError("cr pass failed." + (f" ({err.strip()})" if err.strip() else ""))
-
-    rc, _out, err = _run(_FFMPEG + ["-i", output_path, "-lavfi",
-                                    "showspectrumpic=s=1100x280:legend=0:gain=.5:color=plasma",
-                                    spectrogram_path])
-    if rc != 0:
-        raise RuntimeError("spectrogram render failed." + (f" ({err.strip()})" if err.strip() else ""))
-    _brand_spectrogram(spectrogram_path)
-    return analyze_audio(output_path)
-
-
-def cr_autofit(input_path, output_path, spectrogram_path, progress=None):
-    """Closed-loop auto-fit: the mildest uniform shift the recogniser can't ID.
-
-    Mirrors the Audio Edit App's "Auto-Fit": it probes a candidate shift at every
-    point across the whole song, renders a candidate only when the shift is clean
-    at every point, re-confirms it on the finished file, and escalates to a
-    stronger (but still uniform pitch/tempo) shift until the real recogniser
-    (Shazam via SongRec) can't identify any part. It only ever uses that one
-    method, so the output always sounds like the same song, just a touch faster
-    and/or a half-step flat.
-
-    `progress(msg)` is called between steps (from this worker thread) so the bot
-    can show what it's trying. Returns:
-        {"pitch", "tempo", "clean", "counts", "info"}
-    where `clean` is True only when every probe window confirmed a clean result
-    (counts is None when the search fell back to the strongest shift as a best
-    effort because nothing on the ladder cleared).
-    """
-    if not os.path.isfile(input_path):
-        raise RuntimeError("the input file could not be read from disk.")
-
-    import sys  # noqa: PLC0415
-    if WORKSPACE_ROOT not in sys.path:
-        sys.path.insert(0, WORKSPACE_ROOT)
-
-    try:
-        import shazam_proof as sp  # noqa: PLC0415
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(
-            "The auto-fit engine isn't available in this Python (it needs librosa, "
-            "soundfile and the SongRec package). Run the bot with the same Python "
-            "3.10 that runs the Audio Edit App, which has them -- see "
-            "run_audio_bot.bat. (%s)" % e
-        )
-
-    work_wav = os.path.join(os.path.dirname(output_path) or ".", "autofit_work.wav")
-    if progress:
-        progress("starting the auto-fit search (it contacts Shazam and may take a while)")
-
-    try:
-        result = sp.find_undetectable(input_path, work_wav, progress=progress)
-    except RuntimeError as e:
-        raise RuntimeError(str(e))
-
-    pitch = result["pitch"]
-    tempo = result["tempo"]
-    counts = result.get("counts")
-    clean = counts is not None
-
-    # The engine writes a WAV; re-encode to MP3 so the Discord attachment stays
-    # small enough to send.
-    rc, _out, err = _run(_FFMPEG + ["-i", work_wav, "-c:a", "libmp3lame",
-                                    "-b:a", "192k", output_path])
-    if rc != 0:
-        raise RuntimeError("auto-fit mp3 re-encode failed." + (f" ({err.strip()})" if err.strip() else ""))
-    rc, _out, err = _run(_FFMPEG + ["-i", output_path, "-lavfi",
-                                    "showspectrumpic=s=1100x280:legend=0:gain=.5:color=plasma",
-                                    spectrogram_path])
-    if rc != 0:
-        raise RuntimeError("spectrogram render failed." + (f" ({err.strip()})" if err.strip() else ""))
-    _brand_spectrogram(spectrogram_path)
-
-    if progress:
-        progress(f"done: used {pitch:+.1f} st / tempo {tempo:.2f}x")
-    return {
-        "pitch": pitch,
-        "tempo": tempo,
-        "clean": clean,
-        "counts": counts,
-        "info": analyze_audio(output_path),
-    }
-
-
-# --------------------------------------------------------------------------- #
-# /shazam  (SongRec recognition)
-# --------------------------------------------------------------------------- #
-def shazam_recognize(input_path, progress=None):
-    """Identify an uploaded audio file via Shazam's servers.
-
-    Returns a dict describing the best match:
-        {"matched": bool, "title", "artist", "album", "label", "released",
-         "genres", "coverart", "url", "key"}
-    `matched` is False when Shazam answered cleanly but found nothing. Raises
-    RuntimeError with a friendly message when recognition is impossible.
-    """
-    if not os.path.isfile(input_path):
-        raise RuntimeError("the input file could not be read from disk.")
-
-    import sys  # noqa: PLC0415
-    if WORKSPACE_ROOT not in sys.path:
-        sys.path.insert(0, WORKSPACE_ROOT)
-
-    try:
-        import songrec_tester as st  # noqa: PLC0415
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(
-            "SongRec isn't available in this Python (it needs numpy, requests, "
-            "pytz and the SongRec package). Run the bot with the same Python "
-            "3.10 that runs the Audio Edit App, which has them -- see "
-            "run_audio_bot.bat. (%s)" % e
-        )
-
-    if progress:
-        progress("contacting Shazam to identify the song")
-    try:
-        return st.recognize(input_path, progress=progress)
-    except st.RecognizerError as e:
-        raise RuntimeError(str(e))
-
-
-def search_links(title, artist):
-    """Web search URLs for a title/artist.
-
-    Shazam sometimes returns a hit that isn't a real published release, so a
-    search link lets the user hunt it down instead of getting a dead end.
-    Returns {} when there's nothing to search for.
-    """
-    q = " ".join(x for x in (artist or "", title or "") if x).strip()
-    if not q:
-        return {}
-    enc = urllib.parse.quote_plus(q)
-    return {
-        "YouTube": f"https://www.youtube.com/results?search_query={enc}",
-        "Spotify": f"https://open.spotify.com/search/{enc}",
-        "Apple Music": f"https://music.apple.com/us/search?term={enc}",
-    }
 
 
 # --------------------------------------------------------------------------- #
