@@ -17,8 +17,9 @@ the audio player.
 Killa feature commands (forked from typicaalusername/scope, GPL-3.0), gated to
 the server Owner, Head Mods and Mods:
   /analyze <file>             -- loudness (LUFS/peak) + waveform PNG + playable file.
-  /cr <file> [preset]       -- apply a key/speed shift preset, or Auto-Fit to find
-                                a shift the recogniser can't identify -> mp3 + spectrogram.
+  /cr autofit <file>          -- placeholder. Auto-fit and auto-fit v2 are one
+                                command; the new auto-fit is not hooked up yet.
+  /shazam <file>              -- placeholder. Song identification was removed.
   /roblox <file>              -- two-pass ogg compression simulation.
   /download <url> [kind]      -- download a YouTube/web video (yt-dlp): audio mp3 or <=720p mp4.
   /monitor <asset id>         -- watch a Roblox asset's moderation status.
@@ -29,7 +30,7 @@ the server Owner, Head Mods and Mods:
 Run it:
 
   py -3.10 audio_bot.py        (in the folder with a filled-in .env)
-  or double-click run_audio_bot.bat   (pins the 3.10 that has the auto-fit deps)
+  or double-click run_audio_bot.bat
 
 Env (same file as the main bot, or its own):
   DISCORD_TOKEN   -- token of the bot app you make for THIS bot
@@ -111,10 +112,6 @@ PURPLE = 0x4E2A6E   # KILLA'S BOSS brand accent (deep violet, slightly brightene
 # Where command usage is appended (next to the scripts) so the console log is
 # also a persistent file. Line format: "[YYYY-MM-DD HH:MM:SS] user Name (id) used /cmd ...".
 USAGE_LOG = os.path.join(HERE, "usage.log")
-# Cooldown (seconds) between /cr auto-fit runs, per user. Auto-fit contacts
-# Shazam repeatedly (rate-limited by device id) and takes a while, so it is
-# throttled to stop people hammering it.
-CR_COOLDOWN_SECONDS = int(os.getenv("CR_COOLDOWN_SECONDS", "300") or 300)
 
 # /monitor polling. Polls each watched asset every MONITOR_INTERVAL_SECONDS, and
 # gives up after MONITOR_TIMEOUT_SECONDS (a Roblox moderation review rarely takes
@@ -920,30 +917,6 @@ async def _verifygroup_delete(interaction: discord.Interaction, gid: int):
 active_monitors = {}  # asset id -> asyncio.Task
 _watcher_display = {}  # asset id -> display name (for the 'list' view)
 
-# /cr auto-fit throttle. Only one auto-fit may run at a time (it hits Shazam,
-# which rate-limits by device id), and each user gets a per-run cooldown so they
-# can't start a new fit immediately after one ends.
-_cr_autofit_running = False
-_cr_cooldown_until = {}  # user id -> epoch after which they may auto-fit again
-
-
-async def _update_cr_progress(msg, lines):
-    """Keep the deferred message updated with the latest auto-fit step.
-
-    Runs alongside the worker thread; cancels when the fit is done. Any stale
-    edit is swallowed so a finished run can't be disturbed by an in-flight one.
-    """
-    shown = 0
-    while True:
-        if len(lines) > shown:
-            shown = len(lines)
-            try:
-                await msg.edit(content="Auto-fit: " + lines[-1])
-            except Exception:  # noqa: BLE001
-                return
-        await asyncio.sleep(3)
-
-
 # A state is "final" once the moderation decision is locked in. In the review
 # vocabulary an asset may sit at NotReviewed / Reviewing / Pending for a while;
 # only these are treated as a done deal so the watcher keeps polling through
@@ -1410,8 +1383,8 @@ async def ping_slash(interaction: discord.Interaction):
 def _audio_embed(title, filename, info, note=None, image="waveform.png", tag="audio analysis"):
     """Build a clean embed for a processed audio file (spec fields + image).
 
-    `image` is the filename of the attached image to show inline (e.g. the
-    waveform or the spectrogram); `tag` sets the branded footer label.
+    `image` is the filename of the attached image to show inline (the waveform);
+    `tag` sets the branded footer label.
     """
     sr = info.get("sample_rate")
     chn = info.get("channels")
@@ -1469,217 +1442,50 @@ async def analyze_slash(interaction: discord.Interaction, file: discord.Attachme
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-@bot.tree.command(
+# /cr is a command group. The old auto-fit and auto-fit v2 prefixes are one
+# subcommand. The new auto-fit is intentionally not implemented yet.
+cr_group = app_commands.Group(
     name="cr",
-    description="Apply an audio preset (key/speed change) or auto-fit to an attached file.",
+    description="Process an attached audio file.",
 )
-@app_commands.describe(
-    file="The audio file to process.",
-    preset="The processing preset to apply, or Auto-Fit to find a clean shift.",
+
+
+@cr_group.command(
+    name="autofit",
+    description="Auto-fit an attached audio file. Not available yet.",
 )
-@app_commands.choices(
-    preset=[
-        app_commands.Choice(name="Subtle", value="subtle"),
-        app_commands.Choice(name="Balanced", value="balanced"),
-        app_commands.Choice(name="Stealth", value="stealth"),
-        app_commands.Choice(name="Aggressive", value="aggressive"),
-        app_commands.Choice(name="Auto-Fit (closest)", value="autofit"),
-    ],
-)
-async def cr_slash(interaction: discord.Interaction,
-                     file: discord.Attachment, preset: str):
-    # These are module-level; writing them inside the function would otherwise
-    # make Python treat them as local and raise UnboundLocalError on the reads
-    # below (the auto-fit gate).
-    global _cr_autofit_running, _cr_cooldown_until
+@app_commands.describe(file="The audio file to process.")
+async def cr_autofit_slash(interaction: discord.Interaction, file: discord.Attachment):
+    """Placeholder. The combined auto-fit command is not hooked up yet."""
     if not await _require(interaction):
         return
-    is_autofit = preset == "autofit"
+    name = file.filename or "that file"
+    await interaction.response.send_message(
+        f"Auto-fit isn't available yet, so **{name}** was not processed. "
+        "Auto-fit and auto-fit v2 are now this one command, and the new "
+        "auto-fit hasn't been added.",
+        ephemeral=True,
+    )
 
-    # Auto-fit is throttled: only one runs at a time (it contacts Shazam, which
-    # rate-limits by device id), and each user is cooled down between runs.
-    if is_autofit:
-        now = time.time()
-        if _cr_autofit_running:
-            _log(f"cr-autofit BLOCKED (already running) for {interaction.user} "
-                 f"(id {interaction.user.id})")
-            await interaction.response.send_message(
-                "The auto-fit is already testing a file right now. Wait for it "
-                "to finish, then run this again.", ephemeral=True)
-            return
-        until = _cr_cooldown_until.get(interaction.user.id, 0)
-        if now < until:
-            remain = int(until - now)
-            _log(f"cr-autofit BLOCKED (cooldown {remain}s) for {interaction.user} "
-                 f"(id {interaction.user.id})")
-            await interaction.response.send_message(
-                f"This command is on cooldown. Try again in **{remain} second"
-                f"{'' if remain == 1 else 's'}**.", ephemeral=True)
-            return
-        _cr_autofit_running = True
-    elif preset not in killa_tools.CR_PRESETS:
-        await interaction.response.send_message(
-            f"unknown preset `{preset}`. pick one of: "
-            + ", ".join(killa_tools.CR_PRESETS) + ", or autofit", ephemeral=True)
-        return
 
-    await interaction.response.defer(thinking=True)
-    workdir = tempfile.mkdtemp(prefix="kb_cr_")
-    try:
-        input_path = await _save_attachment(workdir, file)
-        output_path = os.path.join(workdir, "output.mp3")
-        spec_path = os.path.join(workdir, "spectrogram.png")
-        # Export the shifted copy under the source's own name + "_cr" so the
-        # copyright-safe version is identifiable (e.g. "song.mp3" -> "song_cr.mp3").
-        out_stem = os.path.splitext(file.filename or "audio")[0] or "audio"
-        cr_name = f"{out_stem}_cr.mp3"
-
-        if is_autofit:
-            progress_lines = []
-
-            def _progress(msg):
-                progress_lines.append(msg)
-                _log(f"cr-autofit progress: {msg}")
-
-            # Surface each step in the deferred message so the user sees which
-            # shift is being tried ("getting the best it can get to").
-            msg = await interaction.original_response()
-            updater = asyncio.create_task(_update_cr_progress(msg, progress_lines))
-            try:
-                result = await asyncio.to_thread(
-                    killa_tools.cr_autofit, input_path, output_path, spec_path, _progress)
-            finally:
-                updater.cancel()
-            # Only cool the user down once the run actually reached Shazam. A run
-            # that failed immediately (e.g. a missing engine dep) doesn't lock them out.
-            _cr_cooldown_until[interaction.user.id] = time.time() + CR_COOLDOWN_SECONDS
-
-            verdict = (
-                "the processed file wasn't identifiable at any probe point."
-                if result["clean"] else
-                "the strongest shift still matched part of the file, so it was "
-                "produced as a best effort (not guaranteed)."
-            )
-            embed = discord.Embed(
-                title="Auto-Fit Complete",
-                description=f"Processed **{file.filename}** so a matcher can't identify it.\n"
-                            f"Exported as **{cr_name}**.",
-                color=PURPLE,
-            )
-            info = result.get("info") or {}
-            embed.add_field(name="Pitch", value=f"{result['pitch']:+.1f} st", inline=True)
-            embed.add_field(name="Tempo", value=f"{result['tempo']:.2f}x", inline=True)
-            if info.get("duration"):
-                embed.add_field(name="Duration", value=info.get("duration", "—"), inline=True)
-            if info.get("codec"):
-                embed.add_field(name="Codec", value=info.get("codec", "—"), inline=True)
-            if info.get("sample_rate"):
-                embed.add_field(name="Sample Rate", value=f"{info['sample_rate']} Hz", inline=True)
-            embed.add_field(name="Result", value=verdict, inline=False)
-            embed.set_image(url="attachment://spectrogram.png")
-            _brand_footer(embed, "auto-fit")
-            _log(f"cr-autofit DONE for {interaction.user} (id {interaction.user.id}): "
-                 f"pitch {result['pitch']:+.1f} st, tempo {result['tempo']:.2f}x, "
-                 f"clean={result['clean']}")
-            await interaction.followup.send(
-                embed=embed,
-                files=[discord.File(output_path, filename=cr_name),
-                       discord.File(spec_path, filename="spectrogram.png")])
-        else:
-            info = await asyncio.to_thread(killa_tools.cr_process, input_path, output_path,
-                                           spec_path, preset)
-            semi, tempo = killa_tools.CR_PRESETS[preset]
-            embed = _audio_embed(
-                f"Preset Applied — {preset}",
-                cr_name,
-                info,
-                note=f"Shifted by {semi:+.1f} st, tempo {tempo:.2f}x ({preset} preset).",
-                image="spectrogram.png",
-                tag="cr preset",
-            )
-            await interaction.followup.send(
-                embed=embed,
-                files=[discord.File(output_path, filename=cr_name),
-                       discord.File(spec_path, filename="spectrogram.png")])
-    except Exception as e:  # noqa: BLE001
-        await interaction.followup.send(f"cr failed: {e}", ephemeral=True)
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
-        if is_autofit:
-            _cr_autofit_running = False
+bot.tree.add_command(cr_group)
 
 
 @bot.tree.command(
     name="shazam",
-    description="Identify the song in an attached audio file via Shazam.",
+    description="Identify the song in an attached audio file.",
 )
 @app_commands.describe(file="The audio file to identify.")
 async def shazam_slash(interaction: discord.Interaction, file: discord.Attachment):
+    """Placeholder. Song identification was removed and will be replaced."""
     if not await _require(interaction):
         return
-    await interaction.response.defer(thinking=True)
-    workdir = tempfile.mkdtemp(prefix="kb_shazam_")
-    try:
-        input_path = await _save_attachment(workdir, file)
-        result = await asyncio.to_thread(killa_tools.shazam_recognize, input_path)
-        if not result.get("matched"):
-            embed = discord.Embed(
-                title="Shazam couldn't identify that",
-                description=(
-                    f"**{file.filename}** wasn't recognised by Shazam. "
-                    "Try a longer or clearer clip of the song."
-                ),
-                color=RED,
-            )
-            _brand_footer(embed, "shazam")
-            await interaction.followup.send(embed=embed)
-            return
-
-        title = result.get("title") or "Recognised Track"
-        artist = result.get("artist")
-        album = result.get("album")
-        released = result.get("released")
-        label = result.get("label")
-        genres = result.get("genres")
-        embed = discord.Embed(
-            title=title,
-            description=f"**{file.filename}** was identified.",
-            color=PURPLE,
-        )
-        if artist:
-            embed.add_field(name="Artist", value=artist, inline=True)
-        if album:
-            embed.add_field(name="Album", value=album, inline=True)
-        if genres:
-            embed.add_field(name="Genre", value=genres, inline=True)
-        if released:
-            embed.add_field(name="Released", value=released, inline=True)
-        if label:
-            embed.add_field(name="Label", value=label, inline=True)
-        url = result.get("url")
-        if url:
-            embed.add_field(name="Shazam", value=f"[View on Shazam]({url})", inline=False)
-        cover = result.get("coverart")
-        if cover:
-            embed.set_thumbnail(url=cover)
-        if title and title != "Recognised Track":
-            # Shazam sometimes returns a hit that isn't a real published release,
-            # so give the user a way to hunt the name down themselves.
-            links = killa_tools.search_links(title, artist)
-            if links:
-                embed.add_field(
-                    name="Search",
-                    value="\n".join(f"[{k}]({v})" for k, v in links.items()),
-                    inline=False,
-                )
-        _brand_footer(embed, "shazam")
-        _log(f"shazam DONE for {interaction.user} (id {interaction.user.id}): "
-             f"{title!r} by {artist!r}")
-        await interaction.followup.send(embed=embed)
-    except Exception as e:  # noqa: BLE001
-        await interaction.followup.send(f"shazam failed: {e}", ephemeral=True)
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
+    name = file.filename or "that file"
+    await interaction.response.send_message(
+        f"Song identification isn't available yet, so **{name}** was not looked up. "
+        "This command is a placeholder and will be replaced.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(
@@ -2052,6 +1858,25 @@ async def groups_slash(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=False)
 
 
+def _slash_log_options(options):
+    """Flatten slash-command options, including a group's nested subcommand."""
+    parts = []
+    for o in options or []:
+        if not isinstance(o, dict) or not o.get("name"):
+            continue
+        nested = o.get("options")
+        if isinstance(nested, list):
+            parts.extend(_slash_log_options(nested))
+            continue
+        v = o.get("value")
+        if v is None:
+            continue
+        if isinstance(v, (list, dict)):
+            v = json.dumps(v, default=str)
+        parts.append(f"{o['name']}={v}")
+    return parts
+
+
 @bot.event
 async def on_interaction(interaction):
     """Log every slash-command use (who, when, and the options) to the console
@@ -2061,15 +1886,10 @@ async def on_interaction(interaction):
     if cmd is None:
         return  # component / modal interactions aren't commands
     _cmd_count += 1
-    opts = []
-    for o in (interaction.data or {}).get("options", []) or []:
-        if isinstance(o, dict) and o.get("name"):
-            v = o.get("value")
-            if isinstance(v, (list, dict)):
-                v = json.dumps(v, default=str)
-            opts.append(f"{o['name']}={v}")
+    name = getattr(cmd, "qualified_name", None) or cmd.name
+    opts = _slash_log_options((interaction.data or {}).get("options", []) or [])
     opt_txt = (" " + " ".join(opts)) if opts else ""
-    _log(f"user {interaction.user} (id {interaction.user.id}) used /{cmd.name}{opt_txt}")
+    _log(f"user {interaction.user} (id {interaction.user.id}) used /{name}{opt_txt}")
 
 
 def _cleanup_stale_workdirs(max_age=24 * 3600):
